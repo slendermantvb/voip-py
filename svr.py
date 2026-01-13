@@ -1,306 +1,307 @@
-# server.py - Servidor de Señalización VoIP (reenviando señales WebRTC)
-
-import socket
-import threading
+# server.py - Servidor de Señalización VoIP Avanzado (AsyncIO)
+import asyncio
+import logging
 import time
 import hashlib
+from typing import Dict, Tuple, Optional, Any
+from dataclasses import dataclass
+from collections import defaultdict
 
-HOST = "0.0.0.0"
-PORT = 24646
+# --- CONFIGURACIÓN AVANZADA ---
+HOST: str = "0.0.0.0"
+PORT: int = 20159
+MAX_PACKET_SIZE: int = 65535
+RATE_LIMIT_WINDOW: float = 1.0  # Segundos
+RATE_LIMIT_MAX_REQUESTS: int = 50  # Requests por IP por ventana
+CLIENT_TIMEOUT: float = 60.0    # Segundos para timeout de cliente
 
-clients = {}  # {number: (ip, port, last_seen, name)}
-recent = {}   # {(addr, hash): last_time}
-claimed = {}  # {number: claimed_port}
+# --- LOGGING SISTEMA ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)8s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger("VoIP_Sys")
 
-lock = threading.Lock()
+@dataclass
+class ClientInfo:
+    ip: str
+    port: int
+    last_seen: float
+    name: str
 
-def _send_redundant_bytes(sock, addr, data, copies=2, delay=0.01):
-    ok = False
-    for i in range(max(1, copies)):
-        try:
-            sock.sendto(data, addr)
-            ok = True
-        except Exception as e:
-            print(f"[ERR] send to {addr}: {e}")
-        if copies > 1 and i < copies - 1:
-            time.sleep(delay)
-    return ok
+class RateLimiter:
+    def __init__(self):
+        self.requests: Dict[str, list] = defaultdict(list)
 
-def _send_ok(sock, addr):
-    return _send_redundant_bytes(sock, addr, b"OK", copies=2, delay=0.02)
-
-def forward(to_number, payload, sock):
-    info = clients.get(to_number)
-    if info:
-        ip, port, _, _ = info
-        try:
-            _send_redundant_bytes(sock, (ip, port), payload.encode(), copies=2, delay=0.02)
-            cport = claimed.get(to_number, 0)
-            if isinstance(cport, int) and cport > 0 and cport != port:
-                _send_redundant_bytes(sock, (ip, cport), payload.encode(), copies=2, delay=0.02)
+    def is_allowed(self, ip: str) -> bool:
+        now = time.time()
+        # Limpiar requests viejos
+        self.requests[ip] = [t for t in self.requests[ip] if now - t < RATE_LIMIT_WINDOW]
+        
+        if len(self.requests[ip]) < RATE_LIMIT_MAX_REQUESTS:
+            self.requests[ip].append(now)
             return True
+        return False
+
+class SignalingServer:
+    def __init__(self):
+        self.clients: Dict[str, ClientInfo] = {}  # number -> ClientInfo
+        self.claimed_ports: Dict[str, int] = {}   # number -> claimed_port
+        self.transport: Optional[asyncio.DatagramTransport] = None
+        self.rate_limiter = RateLimiter()
+        self.dedup_cache: Dict[Tuple[str, str], float] = {} # ((ip, port), hash) -> timestamp
+
+    def connection_made(self, transport: asyncio.DatagramTransport):
+        self.transport = transport
+        logger.info(f"🚀 Sistema VoIP Iniciado en {HOST}:{PORT}")
+        logger.info(f"⚙️  Modelo: AsyncIO High-Performance | RateLimit: {RATE_LIMIT_MAX_REQUESTS}req/s")
+
+    def connection_lost(self, exc: Optional[Exception]):
+        logger.error(f"❌ Conexión terminada: {exc}")
+
+    def datagram_received(self, data: bytes, addr: Tuple[str, int]):
+        # 1. Rate Limiting
+        if not self.rate_limiter.is_allowed(addr[0]):
+            if len(self.rate_limiter.requests[addr[0]]) == RATE_LIMIT_MAX_REQUESTS:
+                logger.warning(f"🛡️ Rate Limit Excedido: {addr[0]}")
+            return
+
+        # 2. Decodificación
+        try:
+            msg = data.decode(errors="ignore").strip()
+        except:
+            return
+
+        # 3. Deduplicación (Anti-Replay / Redundancy check)
+        # Check simple para evitar procesar el mismo paquete (por redundancia de red)
+        msg_hash = hashlib.md5(msg.encode()).hexdigest()
+        dedup_key = (f"{addr[0]}:{addr[1]}", msg_hash)
+        now = time.time()
+        last_time = self.dedup_cache.get(dedup_key, 0)
+        
+        # Si recibimos el mismo hash en menos de 300ms, lo ignoramos
+        if now - last_time < 0.3:
+            return
+        
+        self.dedup_cache[dedup_key] = now
+        # Limpieza perezosa del cache de dedup (super simple)
+        if len(self.dedup_cache) > 5000:
+            self.dedup_cache.clear()
+
+        # 4. Procesamiento
+        asyncio.create_task(self.handle_command(msg, addr))
+
+    def _send(self, data: bytes, addr: Tuple[str, int], copies: int = 1):
+        if not self.transport: return
+        try:
+            for _ in range(copies):
+                self.transport.sendto(data, addr)
         except Exception as e:
-            print(f"[ERR] forward to {to_number}: {e}")
-    return False
+            logger.error(f"Error enviando a {addr}: {e}")
 
+    async def handle_command(self, msg: str, addr: Tuple[str, int]):
+        parts = msg.split(":")
+        cmd = parts[0]
+        
+        # Actualizar "last_seen" si ya conocemos el cliente por IP
+        # (Opcional, pero bueno para mantener vivas las sesiones NAT)
 
-def cleanup():
-    while True:
-        time.sleep(30)
-        now = time.time()
-        with lock:
-            expired = [n for n, (_, _, t, _) in clients.items() if now - t > 60]
-            for n in expired:
-                print(f"[OFFLINE] {n}")
-                del clients[n]
-
-
-def handle(data, addr, sock):
-    try:
-        if len(data) > 65535:
-            return
-        msg = data.decode(errors="ignore").strip()
-        print(f"[REC] {msg} from {addr}")
-    except:
-        return
-
-    try:
-        h = hashlib.sha256((str(addr) + "|" + msg).encode()).hexdigest()
-        now = time.time()
-        last = recent.get((addr, h), 0)
-        if now - last < 0.3:
-            return
-        recent[(addr, h)] = now
-    except:
-        pass
-
-    parts = msg.split(":")
-    cmd = parts[0]
-
-    with lock:
         if cmd == "REGISTER":
-            number = parts[1]
-            claimed_port = int(parts[2]) if len(parts) >= 3 else 0
-            name = parts[3] if len(parts) >= 4 else ""
-            number = (number or "")[:32]
-            name = (name or "")[:32]
-            clients[number] = (addr[0], addr[1], time.time(), name)
-            try:
-                claimed[number] = claimed_port
-            except Exception:
-                pass
-            print(f"[ONLINE] {number} ({name}) -> {addr[0]}:{addr[1]} (claimed {claimed_port})")
-            _send_ok(sock, addr)
+            # REGISTER:number:claimed_port:name
+            number = parts[1] if len(parts) > 1 else ""
+            c_port = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            name = parts[3] if len(parts) > 3 else ""
+            
+            number = number[:32]
+            name = name[:32]
+            
+            self.clients[number] = ClientInfo(addr[0], addr[1], time.time(), name)
+            if c_port > 0:
+                self.claimed_ports[number] = c_port
+                
+            logger.info(f"✅ REGISTRADO: {number} ({name}) -> {addr[0]}:{addr[1]}")
+            self._send(b"OK", addr, copies=2)
 
         elif cmd == "PING":
-            number = parts[1] if len(parts) >= 2 else ""
-            number = (number or "")[:32]
-            if number in clients:
-                ip, port, _, name = clients[number]
-                clients[number] = (ip, port, time.time(), name)
-            else:
-                clients[number] = (addr[0], addr[1], time.time(), "")
-                print(f"[ONLINE_AUTO] {number} -> {addr[0]}:{addr[1]}")
-            try:
-                _send_redundant_bytes(sock, addr, b"PONG", copies=2, delay=0.02)
-            except Exception as e:
-                print(f"[ERR] PONG to {addr}: {e}")
+            number = parts[1] if len(parts) > 1 else ""
+            if number in self.clients:
+                self.clients[number].last_seen = time.time()
+                # Actualizar IP/Port por si cambió NAT
+                self.clients[number].ip = addr[0]
+                self.clients[number].port = addr[1]
+                
+            self._send(b"PONG", addr, copies=1)
 
         elif cmd == "CALL":
-            callee = parts[1] if len(parts) >= 2 else ""
-            caller = parts[2] if len(parts) >= 3 else ""
-            callee = (callee or "")[:32]
-            caller = (caller or "")[:32]
-            print(f"[CALL] {caller} -> {callee}")
+            # CALL:callee:caller
+            callee = parts[1] if len(parts) > 1 else ""
+            caller = parts[2] if len(parts) > 2 else ""
+            
+            logger.info(f"📞 CALL {caller} -> {callee}")
+            
             caller_name = ""
-            if caller in clients:
-                _, _, _, caller_name = clients.get(caller, ("", 0, 0, ""))
-            sent = forward(callee, f"CALL_FROM:{caller}:{caller_name}", sock)
-            try:
-                if sent:
-                    _send_ok(sock, addr)
-                    _send_redundant_bytes(sock, addr, f"RINGING_FROM:{callee}".encode(), copies=2, delay=0.02)
-                else:
-                    _send_redundant_bytes(sock, addr, f"OFFLINE:{callee}".encode(), copies=2, delay=0.02)
-                    print(f"[MISS] callee {callee} no registrado")
-            except Exception as e:
-                print(f"[ERR] ACK CALL to {addr}: {e}")
+            if caller in self.clients:
+                caller_name = self.clients[caller].name
 
-        elif cmd == "ACCEPT":
-            caller = parts[1] if len(parts) >= 2 else ""
-            callee = parts[2] if len(parts) >= 3 else ""
-            caller = (caller or "")[:32]
-            callee = (callee or "")[:32]
-            print(f"[ACCEPT] {callee} -> {caller}")
-            sent = forward(caller, f"ACCEPT_FROM:{callee}", sock)
-            try:
-                if sent:
-                    _send_ok(sock, addr)
-                else:
-                    _send_redundant_bytes(sock, addr, f"OFFLINE:{caller}".encode(), copies=2, delay=0.02)
-                    print(f"[MISS] caller {caller} no registrado")
-            except Exception as e:
-                print(f"[ERR] ACK ACCEPT to {addr}: {e}")
-
-        elif cmd == "REJECT":
-            caller = parts[1] if len(parts) >= 2 else ""
-            callee = parts[2] if len(parts) >= 3 else ""
-            caller = (caller or "")[:32]
-            callee = (callee or "")[:32]
-            print(f"[REJECT] {callee} -> {caller}")
-            sent = forward(caller, f"REJECT_FROM:{callee}", sock)
-            try:
-                if sent:
-                    _send_ok(sock, addr)
-                else:
-                    _send_redundant_bytes(sock, addr, f"OFFLINE:{caller}".encode(), copies=2, delay=0.02)
-                    print(f"[MISS] caller {caller} no registrado")
-            except Exception as e:
-                print(f"[ERR] ACK REJECT to {addr}: {e}")
-
-        elif cmd == "BUSY":
-            caller = parts[1] if len(parts) >= 2 else ""
-            callee = parts[2] if len(parts) >= 3 else ""
-            caller = (caller or "")[:32]
-            callee = (callee or "")[:32]
-            print(f"[BUSY] {callee} -> {caller}")
-            sent = forward(caller, f"BUSY_FROM:{callee}", sock)
-            try:
-                if sent:
-                    _send_ok(sock, addr)
-                else:
-                    _send_redundant_bytes(sock, addr, f"OFFLINE:{caller}".encode(), copies=2, delay=0.02)
-                    print(f"[MISS] caller {caller} no registrado")
-            except Exception as e:
-                print(f"[ERR] ACK BUSY to {addr}: {e}")
-
-        elif cmd in ("OFFER_B64", "WEBRTC_OFFER_B64"):
-            # OFFER_B64:callee:caller:<b64>
-            if len(parts) >= 4:
-                callee = parts[1]
-                caller = parts[2]
-                b64 = ":".join(parts[3:])  # por si hay ':' en base64
-                callee = (callee or "")[:32]
-                caller = (caller or "")[:32]
-                print(f"[OFFER] {caller} -> {callee}")
-                sent = forward(callee, f"OFFER_FROM_B64:{caller}:{b64}", sock)
-                if sent:
-                    _send_ok(sock, addr)
-                else:
-                    _send_redundant_bytes(sock, addr, f"OFFLINE:{callee}".encode(), copies=2, delay=0.02)
-                    print(f"[MISS] callee {callee} no registrado")
+            # Forwarding
+            sent = await self._forward(callee, f"CALL_FROM:{caller}:{caller_name}")
+            if sent:
+                self._send(b"OK", addr)
+                # Ringing feedback
+                self._send(f"RINGING_FROM:{callee}".encode(), addr, copies=2)
             else:
-                print("[OFFER] malformed")
-                _send_redundant_bytes(sock, addr, b"ERR", copies=2, delay=0.02)
+                self._send(f"OFFLINE:{callee}".encode(), addr, copies=2)
 
-        elif cmd in ("ANSWER_B64", "WEBRTC_ANSWER_B64"):
-            # ANSWER_B64:caller:callee:<b64>
-            if len(parts) >= 4:
-                caller = parts[1]
-                callee = parts[2]
-                b64 = ":".join(parts[3:])
-                caller = (caller or "")[:32]
-                callee = (callee or "")[:32]
-                print(f"[ANSWER] {callee} -> {caller}")
-                sent = forward(caller, f"ANSWER_FROM_B64:{callee}:{b64}", sock)
-                if sent:
-                    _send_ok(sock, addr)
-                else:
-                    _send_redundant_bytes(sock, addr, f"OFFLINE:{caller}".encode(), copies=2, delay=0.02)
-                    print(f"[MISS] caller {caller} no registrado")
+        elif cmd in ("ACCEPT", "REJECT", "BUSY", "BYE"):
+            # GENERIC FORWARDING COMMANDS
+            # CMD:target:source
+            target = parts[1] if len(parts) > 1 else ""
+            source = parts[2] if len(parts) > 2 else ""
+            
+            logger.info(f"➡️  {cmd} {source} -> {target}")
+            
+            payload = f"{cmd}_FROM:{source}" # Ej: ACCEPT_FROM:123
+            sent = await self._forward(target, payload)
+            if sent:
+                self._send(b"OK", addr)
             else:
-                print("[ANSWER] malformed")
-                _send_redundant_bytes(sock, addr, b"ERR", copies=2, delay=0.02)
+                self._send(f"OFFLINE:{source}".encode(), addr)
 
-        elif cmd in ("ICE_B64", "WEBRTC_ICE_B64"):
-            # ICE_B64:to:from:<b64>
+        elif cmd in ("OFFER_B64", "ANSWER_B64", "ICE_B64"):
+            # WebRTC Signaling / Large Payload Forwarding
+            # CMD:target:source:<data>
             if len(parts) >= 4:
-                to = parts[1]
-                frm = parts[2]
-                b64 = ":".join(parts[3:])
-                to = (to or "")[:32]
-                frm = (frm or "")[:32]
-                print(f"[ICE] {frm} -> {to}")
-                sent = forward(to, f"ICE_FROM_B64:{frm}:{b64}", sock)
-                if sent:
-                    _send_ok(sock, addr)
-                else:
-                    _send_redundant_bytes(sock, addr, f"OFFLINE:{to}".encode(), copies=2, delay=0.02)
-                    print(f"[MISS] to {to} no registrado")
+                target = parts[1]
+                source = parts[2]
+                payload_data = ":".join(parts[3:])
+                
+                # logger.debug(f"📡 {cmd} size={len(payload_data)} bytes") # Verbose
+                
+                # Reconstruir mensaje
+                out_cmd = cmd.replace("_B64", "_FROM_B64") # OFFER_FROM_B64
+                if await self._forward(target, f"{out_cmd}:{source}:{payload_data}"):
+                    self._send(b"OK", addr)
             else:
-                print("[ICE] malformed")
-                _send_redundant_bytes(sock, addr, b"ERR", copies=2, delay=0.02)
+                self._send(b"ERR:MALFORMED", addr)
 
-        elif cmd in ("AUDIO_B64",):
+        elif cmd == "AUDIO_B64":
+             # Audio rápido, sin logs excesivos
             if len(parts) >= 4:
-                to = parts[1]
-                frm = parts[2]
-                b64 = ":".join(parts[3:])
-                to = (to or "")[:32]
-                frm = (frm or "")[:32]
-                sent = forward(to, f"AUDIO_FROM_B64:{frm}:{b64}", sock)
-                if sent:
-                    _send_ok(sock, addr)
-                else:
-                    _send_redundant_bytes(sock, addr, f"OFFLINE:{to}".encode(), copies=2, delay=0.02)
-            else:
-                _send_redundant_bytes(sock, addr, b"ERR", copies=2, delay=0.02)
+                target = parts[1]
+                source = parts[2]
+                payload_data = ":".join(parts[3:])
+                await self._forward(target, f"AUDIO_FROM_B64:{source}:{payload_data}")
 
-        elif cmd in ("BYE", "HANGUP"):
-            to = parts[1] if len(parts) >= 2 else ""
-            frm = parts[2] if len(parts) >= 3 else ""
-            to = (to or "")[:32]
-            frm = (frm or "")[:32]
-            print(f"[BYE] {frm} -> {to}")
-            forward(to, f"BYE_FROM:{frm}", sock)
-            try:
-                _send_ok(sock, addr)
-            except Exception as e:
-                print(f"[ERR] ACK BYE to {addr}: {e}")
+        elif cmd == "SMS_PRIVATE":
+            # SMS_PRIVATE:target:source:msg
+            # Forward -> SMS_PRIVATE_FROM:source:name:msg
+            if len(parts) >= 4:
+                target = parts[1]
+                source = parts[2]
+                msg_content = ":".join(parts[3:])
+                
+                source_name = "Unknown"
+                if source in self.clients:
+                    source_name = self.clients[source].name
+                
+                logger.info(f"📩 SMS PRIV {source} -> {target}")
+                sent = await self._forward(target, f"SMS_PRIVATE_FROM:{source}:{source_name}:{msg_content}")
+                if sent:
+                    self._send(b"OK", addr)
+                else:
+                    self._send(f"OFFLINE:{target}".encode(), addr)
+
+        elif cmd == "SMS_GLOBAL":
+            # SMS_GLOBAL:source:msg
+            # Broadcast -> SMS_GLOBAL_FROM:source:name:msg
+            if len(parts) >= 3:
+                source = parts[1]
+                msg_content = ":".join(parts[2:])
+                
+                source_name = "Unknown"
+                if source in self.clients:
+                    source_name = self.clients[source].name
+                
+                logger.info(f"📢 SMS GLOBAL from {source}")
+                
+                payload = f"SMS_GLOBAL_FROM:{source}:{source_name}:{msg_content}".encode()
+                
+                # Broadcast efficiently
+                for num, client in self.clients.items():
+                    if num == source: continue # Don't echo back to sender if they handle it locally
+                    self._send(payload, (client.ip, client.port))
+                    
+                self._send(b"OK", addr)
 
         elif cmd == "LIST":
-            entries = []
-            for n, (_, _, _, nm) in clients.items():
-                nm = nm or ""
-                entries.append(f"{n}|{nm}")
-            online = ",".join(entries)
-            try:
-                _send_redundant_bytes(sock, addr, f"LIST:{online}".encode(), copies=2, delay=0.02)
-            except Exception as e:
-                print(f"[ERR] LIST to {addr}: {e}")
-
+            # Devolver lista de conectados
+            active_users = [f"{n}|{c.name}" for n, c in self.clients.items()]
+            resp = "LIST:" + ",".join(active_users)
+            self._send(resp.encode(), addr, copies=2)
+            
         elif cmd == "UNREGISTER":
-            number = parts[1] if len(parts) >= 2 else ""
-            number = (number or "")[:32]
-            if number in clients:
-                del clients[number]
-            try:
-                _send_ok(sock, addr)
-            except Exception as e:
-                print(f"[ERR] ACK UNREGISTER to {addr}: {e}")
-        else:
-            try:
-                _send_redundant_bytes(sock, addr, b"ERR", copies=2, delay=0.02)
-            except Exception as e:
-                print(f"[ERR] Unknown cmd to {addr}: {e}")
+            number = parts[1] if len(parts) > 1 else ""
+            if number in self.clients:
+                del self.clients[number]
+                logger.info(f"👋 UNREGISTER {number}")
+            self._send(b"OK", addr)
 
+    async def _forward(self, target_number: str, payload_str: str) -> bool:
+        if target_number not in self.clients:
+            return False
+            
+        client = self.clients[target_number]
+        payload = payload_str.encode()
+        
+        # Enviar a la dirección registrada
+        self._send(payload, (client.ip, client.port), copies=2)
+        
+        # Si tiene un "Claimed Port" (puerto fijo mapeado), intentar también allí
+        # Esto ayuda mucho con NATs estrictos si el cliente sabe su puerto externo
+        c_port = self.claimed_ports.get(target_number, 0)
+        if c_port > 0 and c_port != client.port:
+             self._send(payload, (client.ip, c_port), copies=2)
+             
+        return True
 
-def start():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((HOST, PORT))
+    async def cleanup_loop(self):
+        """Tarea en background para limpiar clientes inactivos"""
+        logger.info("🧹 Garbage Inspector activo")
+        while True:
+            await asyncio.sleep(30)
+            now = time.time()
+            expired = []
+            for num, info in self.clients.items():
+                if now - info.last_seen > CLIENT_TIMEOUT:
+                    expired.append(num)
+            
+            for num in expired:
+                logger.info(f"💤 Timeout de cliente: {num}")
+                del self.clients[num]
+                if num in self.claimed_ports:
+                    del self.claimed_ports[num]
+
+async def main():
+    loop = asyncio.get_running_loop()
+    server = SignalingServer()
+    transport, protocol = await loop.create_datagram_endpoint(
+        lambda: server,
+        local_addr=(HOST, PORT)
+    )
+
+    # Iniciar tareas de mantenimiento
+    asyncio.create_task(server.cleanup_loop())
+
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
-    except Exception as e:
-        print(f"[WARN] set sock buffers: {e}")
-    print(f"Servidor VoIP (reenviando señales) en {HOST}:{PORT}")
-
-    threading.Thread(target=cleanup, daemon=True).start()
-
-    while True:
-        data, addr = sock.recvfrom(65535)
-        threading.Thread(target=handle, args=(data, addr, sock), daemon=True).start()
-
+        await asyncio.Future()  # Run forever
+    except asyncio.CancelledError:
+        pass
+    finally:
+        transport.close()
 
 if __name__ == "__main__":
-    start()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("🛑 Servidor detenido manualmente")
